@@ -371,9 +371,10 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
         res_list = []
         for latent in latents:
             latent = latent[None]
-            # latent = scheduler.add_noise(latent, torch.randn_like(latent), timesteps=torch.tensor([1], device=latent.device))
             result_list, vis_list_batch = self.trans_vae.decoder(self.vae, latent, mask=page_alpha)
             vis_list += vis_list_batch
             res_list += result_list
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return LayerdiffPipelineOutput(images=res_list, vis_list=vis_list)

@@ -245,6 +245,8 @@ class TransparentVAEDecoder(torch.nn.Module):
 
             if return_type == 'tensor':
                 result_list.append(y)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
             y = y.clip(0, 1).movedim(1, -1)
@@ -267,6 +269,11 @@ class TransparentVAEDecoder(torch.nn.Module):
             if return_type == 'numpy':
                 png = (png * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
             result_list.append(png)
+
+            # Free intermediate tensors between frames to reduce peak VRAM
+            del y, alpha, fg, cb, vis, png
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if return_rgb:
             return pixel, result_list, vis_list

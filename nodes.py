@@ -341,6 +341,12 @@ class SeeThrough_GenerateLayers:
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
                 "resolution": ("INT", {"default": 1280, "min": 512, "max": 2048, "step": 64}),
                 "num_inference_steps": ("INT", {"default": 30, "min": 1, "max": 100}),
+                "attention_slicing": ("BOOLEAN", {"default": True,
+                                                   "tooltip": "Enable attention slicing to reduce VRAM usage. Recommended for resolution >= 1536."}),
+                "vae_tiling": ("BOOLEAN", {"default": True,
+                                            "tooltip": "Enable tiled VAE decoding. Greatly reduces VRAM for high resolutions."}),
+                "gradient_checkpointing": ("BOOLEAN", {"default": False,
+                                                        "tooltip": "Trade ~20%% slower speed for ~30%% less VRAM. Enable if OOM at high resolution."}),
             },
         }
 
@@ -349,11 +355,33 @@ class SeeThrough_GenerateLayers:
     FUNCTION = "generate"
     CATEGORY = "SeeThrough"
 
-    def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30):
+    def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30,
+                 attention_slicing=True, vae_tiling=True, gradient_checkpointing=False):
         pipeline = layerdiff_model
         device = mm.get_torch_device()
         offload = torch.device("cpu")
         seed_everything(seed)
+
+        # Apply VRAM optimizations
+        if attention_slicing:
+            pipeline.unet.set_attention_slice("auto")
+            print("[SeeThrough] Attention slicing enabled (auto)", flush=True)
+        else:
+            pipeline.unet.set_attention_slice(None)
+
+        if vae_tiling and hasattr(pipeline.vae, 'enable_tiling'):
+            pipeline.vae.enable_tiling()
+            print("[SeeThrough] VAE tiling enabled", flush=True)
+        elif hasattr(pipeline.vae, 'disable_tiling'):
+            pipeline.vae.disable_tiling()
+
+        if hasattr(pipeline.vae, 'enable_slicing'):
+            pipeline.vae.enable_slicing()
+            print("[SeeThrough] VAE slicing enabled", flush=True)
+
+        if gradient_checkpointing:
+            pipeline.unet.enable_gradient_checkpointing()
+            print("[SeeThrough] Gradient checkpointing enabled on UNet", flush=True)
 
         # Convert ComfyUI IMAGE to numpy RGBA
         img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
@@ -419,7 +447,13 @@ class SeeThrough_GenerateLayers:
             for rst, tag in zip(out.images, body_tags):
                 layer_dict[tag] = rst
 
-            head_img = out.images[2]
+            # Free body diffusion tensors before head pass
+            del out
+            torch.cuda.empty_cache()
+            mm.soft_empty_cache()
+            _log_vram("v3 body tensors freed before head pass")
+
+            head_img = layer_dict.get("head")
             nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
             if nz is not None:
                 hx0, hy0, hw, hh = cv2.boundingRect(nz)
@@ -448,9 +482,13 @@ class SeeThrough_GenerateLayers:
                     full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
                     layer_dict[tag] = full
 
+                del out
+                torch.cuda.empty_cache()
+
         pipeline.unet.to(offload)
         pipeline.vae.to(offload)
         pipeline.trans_vae.to(offload)
+        torch.cuda.empty_cache()
         mm.soft_empty_cache()
         _log_vram("GenerateLayers offloaded to CPU")
         print(f"[SeeThrough] GenerateLayers complete: {len(layer_dict)} layers, pipeline offloaded to CPU", flush=True)
@@ -475,6 +513,10 @@ class SeeThrough_GenerateDepth:
                 "layers": ("SEETHROUGH_LAYERS",),
                 "depth_model": ("SEETHROUGH_DEPTH_MODEL",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+                "attention_slicing": ("BOOLEAN", {"default": True,
+                                                   "tooltip": "Enable attention slicing on depth model to reduce VRAM."}),
+                "vae_tiling": ("BOOLEAN", {"default": True,
+                                            "tooltip": "Enable tiled VAE decoding on depth model."}),
             },
         }
 
@@ -483,7 +525,7 @@ class SeeThrough_GenerateDepth:
     FUNCTION = "generate"
     CATEGORY = "SeeThrough"
 
-    def generate(self, layers, depth_model, seed=42):
+    def generate(self, layers, depth_model, seed=42, attention_slicing=True, vae_tiling=True):
         layer_dict = layers.layer_dict
         fullpage = layers.fullpage
         resolution = layers.resolution
@@ -493,6 +535,16 @@ class SeeThrough_GenerateDepth:
 
         print("[SeeThrough] GenerateDepth: running Marigold...", flush=True)
         _log_vram("GenerateDepth start")
+
+        # Apply VRAM optimizations on depth model
+        if attention_slicing and hasattr(marigold, 'unet') and hasattr(marigold.unet, 'set_attention_slice'):
+            marigold.unet.set_attention_slice("auto")
+            print("[SeeThrough] Depth model attention slicing enabled", flush=True)
+        if vae_tiling and hasattr(marigold, 'vae') and hasattr(marigold.vae, 'enable_tiling'):
+            marigold.vae.enable_tiling()
+            print("[SeeThrough] Depth model VAE tiling enabled", flush=True)
+        if hasattr(marigold, 'vae') and hasattr(marigold.vae, 'enable_slicing'):
+            marigold.vae.enable_slicing()
 
         empty_array = np.zeros((resolution, resolution, 4), dtype=np.uint8)
         blended_alpha = np.zeros((resolution, resolution), dtype=np.float32)
@@ -542,6 +594,7 @@ class SeeThrough_GenerateDepth:
         depth_pred = pipe_out.depth_tensor.to(device="cpu", dtype=torch.float32).numpy()
 
         marigold.to(device=offload)
+        torch.cuda.empty_cache()
         mm.soft_empty_cache()
         _log_vram("GenerateDepth offloaded to CPU")
 
